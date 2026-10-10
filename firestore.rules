@@ -1,0 +1,142 @@
+// firestore.rules — KasirKu (SaaS multi-tenant)
+// ============================================================
+// Cara pakai:
+//   1. Pasang Firebase CLI lalu:  firebase deploy --only firestore:rules
+//   2. Atur custom claims tiap pengguna lewat Admin SDK (contoh di bawah):
+//        admin.auth().setCustomUserClaims(uid, { storeId: "toko_abc123", role: "owner" });
+//        admin.auth().setCustomUserClaims(uid, { storeId: "toko_abc123", role: "kasir" });
+//      Tanpa claims storeId, pengguna TIDAK bisa baca/tulis apa pun.
+//   3. Di Firebase Console, aktifkan penegakan App Check untuk Firestore
+//      (melindungi kuota gratis dari spam write oleh app tak dikenal).
+//
+// Struktur yang dilindungi:
+//   stores/{storeId}/ -> pengguna, produk, kategori, transaksi,
+//                        stokMasuk, supplier, piutang (+cicilan),
+//                        pelanggan, stokOpname, agregatHarian
+//
+// Prinsip: isolasi per toko lewat claim storeId; peran owner|kasir lewat
+// claim role. Field "langganan" hanya boleh diubah server (Cloud Function
+// dengan Admin SDK), jadi owner pun tak bisa mengutak-atik masa aktif sendiri.
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helper ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+    function claimStoreId() {
+      return request.auth.token.storeId;
+    }
+    function claimRole() {
+      return request.auth.token.role;
+    }
+    function inStore(storeId) {
+      return signedIn() && claimStoreId() == storeId;
+    }
+    function isOwner() {
+      return signedIn() && claimRole() == 'owner';
+    }
+    function isStaff() {
+      return signedIn() && (claimRole() == 'owner' || claimRole() == 'kasir');
+    }
+
+    // ---------- stores/{storeId} ----------
+    match /stores/{storeId} {
+      // Dokumen toko tidak boleh di-list (mencegah enumerasi toko orang lain).
+      allow list: if false;
+
+      // Onboarding: siapa pun yang login boleh membuat toko; field langganan
+      // wajib TIDAK ikut dibuat (diisi server setelah pembayaran/aktivasi).
+      allow create: if signedIn() && !('langganan' in request.resource.data);
+
+      allow get: if inStore(storeId);
+
+      // Owner boleh ubah profil & pengaturan, tapi TIDAK boleh menyentuh langganan.
+      allow update: if isOwner() && inStore(storeId)
+        && request.resource.data.langganan == resource.data.langganan;
+
+      // Penghapusan toko hanya lewat Admin SDK (console/Cloud Function).
+      allow delete: if false;
+    }
+
+    // ---------- Subkoleksi per toko ----------
+    match /stores/{storeId}/{coll}/{docId} {
+
+      // --- pengguna (owner & kasir) ---
+      allow get: if inStore(storeId)
+        && coll == 'pengguna'
+        && (isOwner() || request.auth.uid == docId);
+      allow list, create, update, delete: if isOwner() && inStore(storeId)
+        && coll == 'pengguna';
+
+      // --- produk & kategori ---
+      allow get, list: if inStore(storeId) && isStaff()
+        && (coll == 'produk' || coll == 'kategori');
+      allow create, update: if isOwner() && inStore(storeId)
+        && (coll == 'produk' || coll == 'kategori')
+        && request.resource.data.keys().hasAll(
+             ['barcode', 'nama', 'hargaBeli', 'hargaTiers', 'stok', 'stokMinimum', 'aktif'])
+        && request.resource.data.hargaBeli is int
+        && request.resource.data.stok is int
+        && request.resource.data.stok >= 0;
+      allow delete: if isOwner() && inStore(storeId)
+        && (coll == 'produk' || coll == 'kategori');
+
+      // --- transaksi: kasir boleh MEMBUAT, tak boleh mengubah/menghapus ---
+      allow create: if inStore(storeId) && isStaff() && coll == 'transaksi'
+        && request.resource.data.keys().hasAll(
+             ['nomor', 'kasirNama', 'items', 'total', 'diskon', 'laba',
+              'bayar', 'kembalian', 'metodeBayar', 'dibuatPada'])
+        && request.resource.data.nomor is string
+        && request.resource.data.items is list
+        && request.resource.data.total is int && request.resource.data.total >= 0
+        && request.resource.data.bayar is int && request.resource.data.bayar >= 0
+        && request.resource.data.metodeBayar in ['tunai', 'qris', 'transfer', 'ewallet', 'piutang'];
+      allow get, list: if inStore(storeId) && isStaff() && coll == 'transaksi';
+      allow update, delete: if isOwner() && inStore(storeId) && coll == 'transaksi';
+
+      // --- stokMasuk, supplier, stokOpname: owner only (kecuali baca staf) ---
+      allow get, list: if inStore(storeId) && isStaff()
+        && (coll == 'stokMasuk' || coll == 'supplier' || coll == 'stokOpname');
+      allow create, update, delete: if isOwner() && inStore(storeId)
+        && (coll == 'stokMasuk' || coll == 'supplier' || coll == 'stokOpname');
+
+      // --- piutang: kasir boleh buat & mencatat pembayaran, tak boleh menaikkan sisa ---
+      allow get, list: if inStore(storeId) && isStaff() && coll == 'piutang';
+      allow create: if inStore(storeId) && isStaff() && coll == 'piutang'
+        && request.resource.data.keys().hasAll(['pelangganNama', 'total', 'sisa']);
+      allow update: if inStore(storeId) && isStaff() && coll == 'piutang'
+        && request.resource.data.sisa <= resource.data.sisa
+        && request.resource.data.total == resource.data.total;
+      allow delete: if isOwner() && inStore(storeId) && coll == 'piutang';
+
+      // --- pelanggan: staf boleh baca & tulis, hapus hanya owner ---
+      allow get, list, create, update: if inStore(storeId) && isStaff()
+        && coll == 'pelanggan';
+      allow delete: if isOwner() && inStore(storeId) && coll == 'pelanggan';
+
+      // --- agregatHarian: dihitung saat tutup toko; tulis hanya owner/server ---
+      allow get, list: if inStore(storeId) && isStaff() && coll == 'agregatHarian';
+      allow create, update, delete: if isOwner() && inStore(storeId)
+        && coll == 'agregatHarian';
+
+      // Subkoleksi cicilan di bawah piutang
+      match /cicilan/{cicilanId} {
+        allow get, list: if inStore(storeId) && isStaff();
+        allow create: if inStore(storeId) && isStaff()
+          && request.resource.data.keys().hasAll(['jumlah', 'tanggal'])
+          && request.resource.data.jumlah is int
+          && request.resource.data.jumlah > 0;
+        allow update, delete: if isOwner() && inStore(storeId);
+      }
+    }
+
+    // Semua path lain: tolak (default deny).
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
